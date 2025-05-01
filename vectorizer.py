@@ -52,8 +52,7 @@ class SVGVectorizer:
         # move output layers to ./bin/layers from ./bin
         self.move_layers()
         # Step 2.5: Convert layers to PBM
-        self.convert_layers_to_pbm(threshold=0.5, blur_radius=1.5)
-
+        self.convert_layers_to_pbm(blur_radius=10.0)
 
         # Step 3: Read palette.json
         palette = self.read_palette()
@@ -67,7 +66,8 @@ class SVGVectorizer:
             if not os.path.exists(layer_path):
                 raise FileNotFoundError(f"❌ Missing layer image: {layer_filename}")
 
-            svg_snippet = self.vectorize_layer(layer_filename, f"#{r:02x}{g:02x}{b:02x}", layer_key)
+            color = f"rgb({r},{g},{b})"
+            svg_snippet = self.vectorize_layer(layer_filename, color, layer_key)
             layers_combined.append(svg_snippet)
 
         # Step 5: Merge and write SVG
@@ -81,56 +81,6 @@ class SVGVectorizer:
 
         print(f"✅ SVG saved to: {output_path}")
         return output_path
-
-    def vectorize_layer(self, layer_filename: str, color: str, layer_id: str) -> str:
-        """
-        Uses Potrace to generate full SVG for a PBM and updates only the fill color.
-        Writes the full layer SVG to ./img/out/{layer_id}.svg and returns it.
-        """
-        layer_stem = os.path.splitext(layer_filename)[0]
-        pbm_path = f"{self.layers_dir}/{layer_stem}.pbm"
-        svg_path = f"{self.layers_dir}/{layer_stem}.svg"
-        output_svg_path = os.path.join(self.output_dir, f"{layer_id}.svg")
-
-        if not os.path.exists(pbm_path):
-            raise FileNotFoundError(f"❌ PBM file not found: {pbm_path}")
-
-        # 🛠️ You were missing this step:
-        self.run_cmd([
-            self.potrace(),
-            "--tight",
-            "-s",
-            "-o", svg_path,
-            pbm_path
-        ])
-
-        if not os.path.exists(svg_path):
-            raise FileNotFoundError(f"❌ Potrace SVG not found: {svg_path}")
-
-        with open(svg_path, "r", encoding="utf-8") as f:
-            svg_text = f.read()
-
-        # Replace fill attribute in first <g> tag (preserves scale/translate)
-        svg_text = re.sub(
-            r'(<g[^>]*)(fill\s*=\s*["\']#[0-9a-fA-F]+["\'])?',
-            rf'\1 fill="{color}"',
-            svg_text,
-            count=1
-        )
-
-        with open(output_svg_path, "w", encoding="utf-8") as f:
-            f.write(svg_text)
-
-        print(f"💾 Saved cleaned layer: {output_svg_path}")
-        return svg_text
-
-    @staticmethod
-    def _merge_layers(layer_svgs: list[str]) -> str:
-        return (
-            '<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">\n' +
-            "\n".join(layer_svgs) +
-            '\n</svg>'
-        )
 
     @staticmethod
     def run_cmd(cmd, cwd=None, check=True) -> str:
@@ -157,7 +107,7 @@ class SVGVectorizer:
                 dst = self.layers_dir + "/" + file
                 shutil.move(src, dst)
 
-    def convert_layers_to_pbm(self, threshold=0.5, blur_radius=1.5, scale=2):
+    def convert_layers_to_pbm(self, blur_radius=10.0, scale=1):
         """
         Convert all PNG mask layers in ./bin/layers to smoothed PBM using mkbitmap.
         Converts PNG to PGM first, then runs mkbitmap.
@@ -185,7 +135,7 @@ class SVGVectorizer:
                     mkbitmap_path,
                     "-f", str(blur_radius),
                     "-s", str(scale),
-                    "-t", str(threshold),
+                    #"-t", str(threshold),
                     "-o", pbm_path,
                     pgm_path
                 ]
@@ -202,3 +152,65 @@ class SVGVectorizer:
             palette = json.load(f)
 
         return palette
+
+    @staticmethod
+    def _merge_layers(layer_svgs: list[str]) -> str:
+        """
+        Wraps a list of <g>...</g> SVG layer strings into a single outer <svg>.
+        """
+        return (
+                '<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">\n' +
+                "\n".join(layer_svgs) +
+                '\n</svg>'
+        )
+
+    def vectorize_layer(self, layer_filename: str, color: str, layer_id: str) -> str:
+        """
+        Extracts the Potrace-generated <g> element, rewrites fill, and returns it.
+        Ensures well-formed XML by properly injecting the fill into <path> tags.
+        """
+        layer_stem = os.path.splitext(layer_filename)[0]
+        pbm_path = f"{self.layers_dir}/{layer_stem}.pbm"
+        svg_path = f"{self.layers_dir}/{layer_stem}.svg"
+        output_svg_path = os.path.join(self.output_dir, f"{layer_id}.svg")
+
+        if not os.path.exists(pbm_path):
+            raise FileNotFoundError(f"❌ PBM file not found: {pbm_path}")
+
+        # Run Potrace
+        self.run_cmd([
+            self.potrace(),
+            "--tight",
+            "--flat",
+            "--turdsize", "120",
+            "-a", "3.5",
+            "-s",
+            "-o", svg_path,
+            pbm_path
+        ])
+
+        with open(svg_path, "r", encoding="utf-8") as f:
+            svg_text = f.read()
+
+        with open(output_svg_path, "w", encoding="utf-8") as f:
+            f.write(svg_text)
+
+        # Extract the <g> block
+        match = re.search(r'(<g\b[^>]*>.*?</g>)', svg_text, flags=re.DOTALL)
+        if not match:
+            raise ValueError(f"❌ Could not extract <g> from: {svg_path}")
+        g_block = match.group(1)
+
+        # Remove fill/stroke from the <g> tag (not <path>)
+        g_block = re.sub(r'(<g\b[^>]*?)\s+(fill|stroke)="[^"]*"', r'\1', g_block)
+
+        # Inject correct fill into each <path> tag
+        g_block = re.sub(
+            r'(<path\b[^>]*?)(/?>)',
+            rf'\1 fill="{color}"\2',
+            g_block
+        )
+
+        print(f"💾 Saved cleaned layer: {output_svg_path}")
+        return f'<g id="{layer_id}">\n{g_block}\n</g>'
+
