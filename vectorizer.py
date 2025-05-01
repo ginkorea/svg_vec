@@ -153,64 +153,64 @@ class SVGVectorizer:
 
         return palette
 
-    @staticmethod
-    def _merge_layers(layer_svgs: list[str]) -> str:
-        """
-        Wraps a list of <g>...</g> SVG layer strings into a single outer <svg>.
-        """
-        return (
-                '<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">\n' +
-                "\n".join(layer_svgs) +
-                '\n</svg>'
-        )
-
     def vectorize_layer(self, layer_filename: str, color: str, layer_id: str) -> str:
         """
-        Extracts the Potrace-generated <g> element, rewrites fill, and returns it.
-        Ensures well-formed XML by properly injecting the fill into <path> tags.
+        Runs Potrace on the PBM with unit=1 (no cropping), grabs its <g> transform,
+        strips any old fill/stroke, injects our fill + even-odd rule, and returns that <g>…</g>.
         """
-        layer_stem = os.path.splitext(layer_filename)[0]
-        pbm_path = f"{self.layers_dir}/{layer_stem}.pbm"
-        svg_path = f"{self.layers_dir}/{layer_stem}.svg"
-        output_svg_path = os.path.join(self.output_dir, f"{layer_id}.svg")
+        stem = os.path.splitext(layer_filename)[0]
+        pbm_path = os.path.join(self.layers_dir, f"{stem}.pbm")
+        svg_path = os.path.join(self.layers_dir, f"{stem}.svg")
+        out_svg = os.path.join(self.output_dir, f"{layer_id}.svg")
 
         if not os.path.exists(pbm_path):
-            raise FileNotFoundError(f"❌ PBM file not found: {pbm_path}")
+            raise FileNotFoundError(f"❌ PBM not found: {pbm_path}")
 
-        # Run Potrace
+        # 1) Run Potrace WITHOUT --tight, but with --unit=1 so viewBox == PBM size
         self.run_cmd([
             self.potrace(),
-            "--tight",
-            "--flat",
-            "--turdsize", "120",
-            "-a", "3.5",
-            "-s",
+            "--unit", "1",  # 1px = 1 user‐unit => width/height == 1024
+            "--flat",  # straight segments only
+            "--turdsize", "32",  # drop small specks
+            "-a", "2.5",  # smoothing
+            "-s",  # SVG output
             "-o", svg_path,
             pbm_path
         ])
 
-        with open(svg_path, "r", encoding="utf-8") as f:
-            svg_text = f.read()
-
-        with open(output_svg_path, "w", encoding="utf-8") as f:
+        # 2) Read & save raw for inspection
+        svg_text = open(svg_path, "r", encoding="utf-8").read()
+        with open(out_svg, "w", encoding="utf-8") as f:
             f.write(svg_text)
 
-        # Extract the <g> block
-        match = re.search(r'(<g\b[^>]*>.*?</g>)', svg_text, flags=re.DOTALL)
-        if not match:
-            raise ValueError(f"❌ Could not extract <g> from: {svg_path}")
-        g_block = match.group(1)
+        # 3) Parse the generated SVG, grab its single <g> (with translate/scale)
+        tree = eTree.parse(svg_path)
+        root = tree.getroot()
+        ns = {"svg": "http://www.w3.org/2000/svg"}
+        g = root.find("svg:g", ns)
+        if g is None:
+            raise ValueError(f"❌ No <g> in {svg_path}")
 
-        # Remove fill/stroke from the <g> tag (not <path>)
-        g_block = re.sub(r'(<g\b[^>]*?)\s+(fill|stroke)="[^"]*"', r'\1', g_block)
+        transform = g.attrib.get("transform", "")
 
-        # Inject correct fill into each <path> tag
-        g_block = re.sub(
-            r'(<path\b[^>]*?)(/?>)',
-            rf'\1 fill="{color}"\2',
-            g_block
-        )
+        # 4) Build our cleaned <g>—strip any old fill/stroke, apply ours + even-odd
+        lines = [f'<g id="{layer_id}" transform="{transform}" fill="{color}" fill-rule="evenodd" stroke="none">']
+        for p in g.findall("svg:path", ns):
+            d = p.attrib.get("d", "").strip()
+            lines.append(f'  <path d="{d}"/>')
+        lines.append("</g>")
 
-        print(f"💾 Saved cleaned layer: {output_svg_path}")
-        return f'<g id="{layer_id}">\n{g_block}\n</g>'
+        return "\n".join(lines)
+
+    @staticmethod
+    def _merge_layers(layer_groups: list[str]) -> str:
+        """
+        Wrap all of the per-layer <g> blocks into one 1024×1024 SVG.
+        Each layer keeps its own transform, so no extra math is needed here.
+        """
+        body = "\n".join(layer_groups)
+        return f'''<svg xmlns="http://www.w3.org/2000/svg"
+    width="1024" height="1024" viewBox="0 0 1024 1024">
+{body}
+</svg>'''
 
